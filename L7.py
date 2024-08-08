@@ -83,3 +83,4 @@ plt.show(block=True)  # 显示图5
 
 1
 2
+3
