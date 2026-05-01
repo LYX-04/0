@@ -1,0 +1,295 @@
+"""
+retrieval_agent.py
+
+一个最小版检索智能体：
+1. 加载本地文档
+2. 切分文档
+3. 建立向量索引
+4. 根据用户问题规划检索
+5. 检索相关片段
+6. 判断证据是否足够
+7. 生成带引用的回答
+"""
+
+from dataclasses import dataclass
+from typing import List, Dict, Any
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+
+
+# =========================
+# 基础数据结构
+# =========================
+
+@dataclass
+class DocumentChunk:
+    id: int
+    text: str
+    source: str
+
+
+# =========================
+# 文档切分
+# =========================
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 80) -> List[str]:
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap
+
+    return chunks
+
+
+# =========================
+# 向量检索器
+# =========================
+
+class VectorRetriever:
+    def __init__(self, embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        self.embedding_model = SentenceTransformer(embedding_model_name)
+        self.index = None
+        self.chunks: List[DocumentChunk] = []
+
+    def build_index(self, docs: Dict[str, str]):
+        """
+        docs 格式：
+        {
+            "doc1.txt": "文档内容...",
+            "doc2.txt": "文档内容..."
+        }
+        """
+        all_chunks = []
+        chunk_id = 0
+
+        for source, text in docs.items():
+            for chunk in chunk_text(text):
+                all_chunks.append(DocumentChunk(
+                    id=chunk_id,
+                    text=chunk,
+                    source=source
+                ))
+                chunk_id += 1
+
+        self.chunks = all_chunks
+
+        embeddings = self.embedding_model.encode(
+            [c.text for c in self.chunks],
+            normalize_embeddings=True
+        )
+
+        embeddings = np.array(embeddings).astype("float32")
+
+        dim = embeddings.shape[1]
+        self.index = faiss.IndexFlatIP(dim)
+        self.index.add(embeddings)
+
+    def search(self, query: str, top_k: int = 5) -> List[DocumentChunk]:
+        query_embedding = self.embedding_model.encode(
+            [query],
+            normalize_embeddings=True
+        )
+
+        query_embedding = np.array(query_embedding).astype("float32")
+
+        scores, indices = self.index.search(query_embedding, top_k)
+
+        results = []
+        for idx in indices[0]:
+            if idx != -1:
+                results.append(self.chunks[idx])
+
+        return results
+
+
+# =========================
+# 检索智能体
+# =========================
+
+class RetrievalAgent:
+    def __init__(self, retriever: VectorRetriever, model: str = "gpt-4.1-mini"):
+        self.client = OpenAI()
+        self.retriever = retriever
+        self.model = model
+
+    def call_llm(self, messages: List[Dict[str, str]]) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.2
+        )
+        return response.choices[0].message.content
+
+    def rewrite_query(self, question: str) -> List[str]:
+        """
+        将用户问题改写成多个检索查询。
+        """
+        prompt = f"""
+你是一个检索规划器。请把用户问题改写成 3 个适合检索的查询。
+要求：
+1. 保留原始含义
+2. 查询要具体
+3. 每行一个查询
+4. 不要解释
+
+用户问题：
+{question}
+"""
+
+        result = self.call_llm([
+            {"role": "system", "content": "你负责将用户问题改写为检索查询。"},
+            {"role": "user", "content": prompt}
+        ])
+
+        queries = [
+            line.strip("- ").strip()
+            for line in result.split("\n")
+            if line.strip()
+        ]
+
+        return queries[:3]
+
+    def judge_evidence(self, question: str, evidence: List[DocumentChunk]) -> bool:
+        """
+        判断当前证据是否足够回答问题。
+        """
+        evidence_text = "\n\n".join(
+            [f"[{i}] 来源：{c.source}\n{c.text}" for i, c in enumerate(evidence)]
+        )
+
+        prompt = f"""
+请判断下面的证据是否足够回答用户问题。
+
+用户问题：
+{question}
+
+证据：
+{evidence_text}
+
+如果证据足够，请只回答 YES。
+如果证据不足，请只回答 NO。
+"""
+
+        result = self.call_llm([
+            {"role": "system", "content": "你负责判断证据是否足够。"},
+            {"role": "user", "content": prompt}
+        ])
+
+        return result.strip().upper().startswith("YES")
+
+    def generate_answer(self, question: str, evidence: List[DocumentChunk]) -> str:
+        """
+        基于证据生成最终回答。
+        """
+        evidence_text = "\n\n".join(
+            [
+                f"[{i + 1}] 来源：{c.source}\n内容：{c.text}"
+                for i, c in enumerate(evidence)
+            ]
+        )
+
+        prompt = f"""
+你是一个严谨的问答助手。请只基于给定证据回答问题。
+
+要求：
+1. 不要编造证据中没有的信息
+2. 如果证据不足，请明确说明
+3. 回答要结构清晰
+4. 关键结论后标注引用编号，例如：[1]、[2]
+
+用户问题：
+{question}
+
+证据：
+{evidence_text}
+"""
+
+        return self.call_llm([
+            {"role": "system", "content": "你是一个基于证据回答问题的检索智能体。"},
+            {"role": "user", "content": prompt}
+        ])
+
+    def answer(self, question: str, top_k: int = 5, max_rounds: int = 2) -> str:
+        """
+        检索智能体主流程：
+        1. 查询改写
+        2. 多查询检索
+        3. 证据去重
+        4. 判断证据是否足够
+        5. 不足则追加检索
+        6. 生成回答
+        """
+        queries = self.rewrite_query(question)
+
+        all_evidence = []
+        seen_ids = set()
+
+        for round_idx in range(max_rounds):
+            for query in queries:
+                results = self.retriever.search(query, top_k=top_k)
+
+                for chunk in results:
+                    if chunk.id not in seen_ids:
+                        all_evidence.append(chunk)
+                        seen_ids.add(chunk.id)
+
+            if self.judge_evidence(question, all_evidence):
+                break
+
+            # 如果证据不足，让 LLM 生成补充检索查询
+            followup_prompt = f"""
+当前证据不足。请基于用户问题生成 2 个新的补充检索查询。
+每行一个查询，不要解释。
+
+用户问题：
+{question}
+"""
+            followup = self.call_llm([
+                {"role": "system", "content": "你负责生成补充检索查询。"},
+                {"role": "user", "content": followup_prompt}
+            ])
+
+            queries = [
+                line.strip("- ").strip()
+                for line in followup.split("\n")
+                if line.strip()
+            ][:2]
+
+        return self.generate_answer(question, all_evidence)
+
+
+# =========================
+# 示例运行
+# =========================
+
+if __name__ == "__main__":
+    docs = {
+        "rag_architecture.txt": """
+检索增强生成 RAG 通常由文档加载、文本切分、向量化、向量检索、重排序和答案生成组成。
+普通 RAG 通常是一次性检索，而检索智能体会先规划检索策略，再根据问题选择工具。
+如果证据不足，检索智能体可以进行多轮检索。
+        """,
+        "agent_system.txt": """
+智能体系统通常包含 Planner、Tool Router、Memory、Tool Executor 和 Reflection 模块。
+Planner 负责拆解任务，Tool Router 负责选择工具，Reflection 负责检查当前结果是否足够。
+        """,
+        "retrieval_quality.txt": """
+提升检索质量的常见方法包括 query rewrite、multi-query retrieval、hybrid search、reranking 和 context compression。
+重排序模型可以提高最终进入大模型上下文的证据相关性。
+        """
+    }
+
+    retriever = VectorRetriever()
+    retriever.build_index(docs)
+
+    agent = RetrievalAgent(retriever)
+
+    question = "检索智能体和普通 RAG 有什么区别？"
+    answer = agent.answer(question)
+
+    print(answer)
